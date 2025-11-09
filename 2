@@ -1,0 +1,147 @@
+# -*- coding: utf-8 -*-
+# 每日掃描台股清單，計算 Score，將 Score≥70 的名單依分數排序，推送到 Discord Webhook
+import os, math, time, json, requests, numpy as np, pandas as pd
+import yfinance as yf
+from datetime import datetime, timezone, timedelta
+
+DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK")
+MIN_SCORE = int(os.getenv("MIN_SCORE", "70"))
+SYMBOLS_FILE = os.getenv("SYMBOLS_FILE", "symbols.txt")
+LOOKBACK = 250  # 下載天數
+
+def ema(s, n): return s.ewm(span=n, adjust=False).mean()
+def sma(s, n): return s.rolling(n, min_periods=n).mean()
+
+def rsi(series, n=14):
+    chg = series.diff()
+    up  = chg.clip(lower=0)
+    dn  = -chg.clip(upper=0)
+    rs  = ema(up, n) / ema(dn, n)
+    return 100 - (100/(1+rs))
+
+def obv(close, vol):
+    dir = np.sign(close.diff()).fillna(0)
+    return (dir * vol).cumsum()
+
+def mfi(df, n=10):
+    tp = (df['High'] + df['Low'] + df['Close'])/3.0
+    mf = tp * df['Volume']
+    pos = np.where(tp > tp.shift(1), mf, 0.0)
+    neg = np.where(tp < tp.shift(1), mf, 0.0)
+    pos_sum = pd.Series(pos, index=df.index).rolling(n, min_periods=n).sum()
+    neg_sum = pd.Series(neg, index=df.index).rolling(n, min_periods=n).sum()
+    mfr = pos_sum / (neg_sum.replace(0, np.nan))
+    out = 100 - (100/(1 + mfr))
+    return out.fillna(50)
+
+def load_symbols():
+    # symbols.txt：一行一檔；上市寫 2330.TW，上櫃寫 6138.TWO
+    with open(SYMBOLS_FILE, "r", encoding="utf-8") as f:
+        syms = [x.strip() for x in f if x.strip() and not x.startswith("#")]
+    return syms
+
+def fetch_ohlcv(sym):
+    # 下載近一年日線資料；auto_adjust=True 免權息處理
+    df = yf.download(sym, period="400d", interval="1d", auto_adjust=True, progress=False)
+    if df is None or df.empty: return None
+    df = df.tail(LOOKBACK).rename(columns=str.title)  # Open High Low Close Volume
+    return df if len(df) >= 120 else None
+
+def score_last(df):
+    c,h,l,v = df['Close'], df['High'], df['Low'], df['Volume']
+    ma20, ma60 = ema(c,20), ema(c,60)
+    vma = sma(v,20)
+    _rsi = rsi(c,14)
+    _mfi = mfi(df,10)
+    _obv = obv(c,v)
+
+    hi_prev = h.rolling(20).max().shift(1)
+    breakout = (c.iloc[-1] > hi_prev.iloc[-1] * 1.01) and (v.iloc[-1] > vma.iloc[-1]*1.3)
+    trend_up = (ma20.iloc[-1] > ma60.iloc[-1]) and (ma20.iloc[-1] > ma20.iloc[-2])
+    money_ok = (_mfi.iloc[-1] > 50 and _mfi.iloc[-1] > _mfi.iloc[-4]) or (_obv.iloc[-1] > _obv.iloc[-4])
+    overheat = (_rsi.iloc[-1] > 80) and (c.iloc[-1] > h.rolling(10).max().iloc[-1])
+    fake_break = (c.iloc[-1] > hi_prev.iloc[-1]) and (v.iloc[-1] < vma.iloc[-1])
+
+    score = 50
+    score += 20 if breakout else 0
+    score += 15 if trend_up else 0
+    score += 15 if money_ok else 0
+    score -= 10 if overheat else 0
+    score -= 10 if fake_break else 0
+    score = int(max(1, min(100, round(score))))
+
+    tags = []
+    if breakout: tags.append("突破")
+    if trend_up: tags.append("趨勢↑")
+    if money_ok: tags.append("資金流↑")
+    if fake_break: tags.append("⚠假突破")
+    if overheat: tags.append("🔥過熱")
+    tags.append(f"RSI {int(_rsi.iloc[-1])}")
+    return score, tags
+
+def post_discord(content=None, embeds=None):
+    payload = {"username":"TW Scanner"}
+    if content: payload["content"] = content
+    if embeds: payload["embeds"] = embeds
+    r = requests.post(DISCORD_WEBHOOK, json=payload, timeout=15)
+    r.raise_for_status()
+
+def main():
+    if not DISCORD_WEBHOOK:
+        raise SystemExit("Missing DISCORD_WEBHOOK env")
+    syms = load_symbols()
+    picks = []
+
+    for i,sym in enumerate(syms,1):
+        try:
+            df = fetch_ohlcv(sym)
+            if df is None: continue
+            sc, tags = score_last(df)
+            if sc >= MIN_SCORE:
+                last = df.iloc[-1]
+                ret10 = (last['Close']/df['Close'].iloc[-11]-1)*100 if len(df) > 11 else np.nan
+                picks.append({
+                    "symbol": sym,
+                    "score": sc,
+                    "price": round(last['Close'],2),
+                    "ret10": None if math.isnan(ret10) else round(ret10,1),
+                    "tags": tags
+                })
+        except Exception as e:
+            # 安靜略過，必要時可印 log
+            pass
+        time.sleep(0.05)  # 避免過快
+
+    picks = sorted(picks, key=lambda x: (-x["score"], -(x["ret10"] or 0)))
+
+    tw_now = datetime.now(timezone.utc) + timedelta(hours=8)
+    head = f"📈 今日台股動能排行榜（Score≥{MIN_SCORE}）{tw_now.strftime('%Y-%m-%d')}"
+
+    if not picks:
+        post_discord(content=head+"\n無符合。")
+        return
+
+    # 2000 字限制 → 切段送
+    lines = [head]
+    for i,p in enumerate(picks,1):
+        tag = "｜".join(p["tags"])
+        r10 = f" 10日:{p['ret10']}%" if p['ret10'] is not None else ""
+        lines.append(f"{i:02d}. {p['symbol']}  S:{p['score']}  Px:{p['price']}{r10} 〔{tag}〕")
+
+    msg = "\n".join(lines)
+    if len(msg) <= 1800:
+        post_discord(content=msg)
+    else:
+        # 拆段
+        post_discord(content=head)
+        chunk = []
+        total = 0
+        for line in lines[1:]:
+            if total + len(line) + 1 > 1800:
+                post_discord(content="\n".join(chunk)); chunk=[]; total=0
+            chunk.append(line); total += len(line)+1
+        if chunk:
+            post_discord(content="\n".join(chunk))
+
+if __name__ == "__main__":
+    main()
